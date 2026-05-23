@@ -9,7 +9,7 @@ def generate_bmp(filename):
 
     # BMP Header & DIB Header
     header = struct.pack('<2sIHHI', b'BM', file_size, 0, 0, pixel_data_offset)
-    dib = struct.pack('<IIIIHHIIIIII', 40, width, height, 1, 24, 0, pixel_data_size, 2835, 2835, 0, 0, 0)
+    dib = struct.pack('<IIIHHIIiiII', 40, width, height, 1, 24, 0, pixel_data_size, 2835, 2835, 0, 0)
 
     pixels = bytearray()
     for y in range(height):
