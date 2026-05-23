@@ -10,11 +10,13 @@ from PySide6.QtWidgets import (
     QMessageBox, QFrame, QFileSystemModel, QFileDialog, QProgressBar,
     QStackedWidget, QScrollArea, QSlider
 )
-from PySide6.QtCore import Qt, QDir, QThread, Signal, QEvent, QUrl
+from PySide6.QtCore import Qt, QDir, QThread, Signal, QEvent, QUrl, QTimer
 from PySide6.QtGui import QColor, QIcon, QPainter, QMovie, QPixmap
 from PySide6.QtSvgWidgets import QSvgWidget
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
+
+from collections import deque
 
 from parsers import load_model
 from renderer import VTKRendererWidget
@@ -145,17 +147,26 @@ class ThumbnailGeneratorWorker(QThread):
         self.is_running = True
         
     def run(self):
-        for filepath in self.filepaths:
-            if not self.is_running:
-                break
-                
-            try:
-                # Load only the model geometry asynchronously (safe, no OpenGL)
-                model_data = load_model(filepath)
-                if self.is_running:
-                    self.model_loaded.emit(filepath, model_data)
-            except Exception as e:
-                print(f"Error loading geometry for thumbnail {filepath}: {e}")
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        max_w = min(os.cpu_count() or 4, 8, len(self.filepaths))
+        pool = ThreadPoolExecutor(max_workers=max_w)
+        try:
+            futures = {pool.submit(load_model, fp): fp for fp in self.filepaths}
+            for future in as_completed(futures):
+                if not self.is_running:
+                    break
+                fp = futures[future]
+                try:
+                    model_data = future.result()
+                    if self.is_running:
+                        self.model_loaded.emit(fp, model_data)
+                except Exception as e:
+                    print(f"Error loading geometry for thumbnail {fp}: {e}")
+        finally:
+            # cancel_futures=True drops pending tasks; wait=False lets running tasks
+            # finish in their own threads without blocking the QThread (and therefore
+            # without blocking the main thread's generator_worker.wait() call).
+            pool.shutdown(wait=False, cancel_futures=True)
                 
     def stop(self):
         self.is_running = False
@@ -575,67 +586,102 @@ class ThumbnailCard(QFrame):
 class ThumbnailGridWidget(QWidget):
     card_clicked = Signal(str)
 
-    _BATCH_SIZE = 20
-
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.cards = []
+        self.cards = {}           # filepath -> ThumbnailCard (O(1) lookup)
+        self._ordered_paths = []  # insertion order for grid layout
         self.generator_worker = None
-        self._pending_3d = []
-        self.layout = QGridLayout(self)
-        self.layout.setSpacing(15)
-        self.layout.setContentsMargins(15, 15, 15, 15)
-        self.layout.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self._render_queue = deque()
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.timeout.connect(self._render_next)
+        self._total_pending = 0
+        self._rendered_count = 0
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setTextVisible(True)
+        self._progress_bar.setFixedHeight(18)
+        self._progress_bar.setFormat("Generating thumbnails: 0 / 0")
+        self._progress_bar.setStyleSheet(
+            "QProgressBar { background: #11131A; border: none; border-bottom: 1px solid #1E222D;"
+            " color: #7A859E; font-size: 10px; text-align: center; }"
+            "QProgressBar::chunk { background: #00F0FF; }"
+        )
+        self._progress_bar.hide()
+        outer.addWidget(self._progress_bar)
+
+        grid_container = QWidget()
+        self._grid_layout = QGridLayout(grid_container)
+        self._grid_layout.setSpacing(15)
+        self._grid_layout.setContentsMargins(15, 15, 15, 15)
+        self._grid_layout.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        outer.addWidget(grid_container, stretch=1)
+
+        self.layout = self._grid_layout  # backward-compat alias
 
     def _stop_workers(self):
+        self._render_timer.stop()
+        self._render_queue.clear()
         if self.generator_worker and self.generator_worker.isRunning():
             self.generator_worker.stop()
             self.generator_worker.wait()
             self.generator_worker = None
-        self._pending_3d = []
+        self._progress_bar.hide()
 
     def set_files(self, filepaths):
         self._stop_workers()
 
-        for card in self.cards:
-            self.layout.removeWidget(card)
+        for card in self.cards.values():
+            self._grid_layout.removeWidget(card)
             card.deleteLater()
-        self.cards = []
+        self.cards = {}
+        self._ordered_paths = []
+        self._rendered_count = 0
+        self._total_pending = 0
 
         for filepath in filepaths:
             card = ThumbnailCard(filepath)
             card.clicked.connect(self.card_clicked.emit)
-            self.cards.append(card)
+            self.cards[filepath] = card
+            self._ordered_paths.append(filepath)
 
         self.rearrange_grid()
 
         uncached_3d = []
-        mesh_exts = ['.stl', '.3mf', '.obj', '.gcode', '.gco']
+        mesh_exts = {'.stl', '.3mf', '.obj', '.gcode', '.gco'}
         cache = get_thumb_cache()
         for filepath in filepaths:
             ext = os.path.splitext(filepath)[1].lower()
             if ext in mesh_exts and not cache.is_valid(filepath):
                 uncached_3d.append(filepath)
 
-        self._pending_3d = uncached_3d[self._BATCH_SIZE:]
-        first_batch = uncached_3d[:self._BATCH_SIZE]
-        if first_batch:
-            self._start_batch(first_batch)
+        if uncached_3d:
+            self._total_pending = len(uncached_3d)
+            self._progress_bar.setRange(0, self._total_pending)
+            self._progress_bar.setValue(0)
+            self._progress_bar.setFormat(
+                f"Generating thumbnails: 0 / {self._total_pending}"
+            )
+            self._progress_bar.show()
+            self.generator_worker = ThumbnailGeneratorWorker(uncached_3d)
+            self.generator_worker.model_loaded.connect(self._on_geom_loaded)
+            self.generator_worker.start()
 
-    def _start_batch(self, batch):
-        self.generator_worker = ThumbnailGeneratorWorker(batch)
-        self.generator_worker.model_loaded.connect(self._on_model_loaded)
-        self.generator_worker.finished.connect(self._on_batch_finished)
-        self.generator_worker.start()
+    def _on_geom_loaded(self, filepath, model_data):
+        """Geometry loaded on background thread — queue it for main-thread VTK render."""
+        self._render_queue.append((filepath, model_data))
+        if not self._render_timer.isActive():
+            self._render_timer.start(0)  # fire on next idle event-loop tick
 
-    def _on_batch_finished(self):
-        if not self._pending_3d:
+    def _render_next(self):
+        """Render one queued thumbnail per event-loop tick to keep UI responsive."""
+        if not self._render_queue:
             return
-        nxt = self._pending_3d[:self._BATCH_SIZE]
-        self._pending_3d = self._pending_3d[self._BATCH_SIZE:]
-        self._start_batch(nxt)
-
-    def _on_model_loaded(self, filepath, model_data):
+        filepath, model_data = self._render_queue.popleft()
         try:
             png_bytes = generate_vtk_thumbnail(model_data)
             if png_bytes:
@@ -646,35 +692,37 @@ class ThumbnailGridWidget(QWidget):
                     self._on_thumbnail_ready(filepath, pixmap)
         except Exception as e:
             print(f"Error rendering thumbnail for {filepath}: {e}")
+        self._rendered_count += 1
+        self._progress_bar.setValue(self._rendered_count)
+        self._progress_bar.setFormat(
+            f"Generating thumbnails: {self._rendered_count} / {self._total_pending}"
+        )
+        if self._rendered_count >= self._total_pending:
+            self._progress_bar.hide()
+        if self._render_queue:
+            self._render_timer.start(0)
 
     def _on_thumbnail_ready(self, filepath, pixmap):
-        for card in self.cards:
-            if card.filepath == filepath:
-                card.update_thumbnail(pixmap)
-                break
-        
+        card = self.cards.get(filepath)
+        if card:
+            card.update_thumbnail(pixmap)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.rearrange_grid()
-        
+
     def rearrange_grid(self):
-        if not self.cards:
+        if not self._ordered_paths:
             return
-            
-        # Determine number of columns based on width
         width = self.width()
-        card_outer_width = 145  # Card width (130) + horizontal grid spacing (15)
+        card_outer_width = 145  # card width (130) + grid spacing (15)
         cols = max(1, width // card_outer_width)
-        
-        # Clear existing layouts references
-        for idx, card in enumerate(self.cards):
-            self.layout.removeWidget(card)
-            
-        # Place cards in grid
-        for idx, card in enumerate(self.cards):
+        for filepath in self._ordered_paths:
+            self._grid_layout.removeWidget(self.cards[filepath])
+        for idx, filepath in enumerate(self._ordered_paths):
             r = idx // cols
             c = idx % cols
-            self.layout.addWidget(card, r, c)
+            self._grid_layout.addWidget(self.cards[filepath], r, c)
 
 
 class MainWindow(QMainWindow):
@@ -690,6 +738,10 @@ class MainWindow(QMainWindow):
         
         self.active_worker = None
         self.precache_worker = None
+        self._precache_render_queue = deque()
+        self._precache_render_timer = QTimer(self)
+        self._precache_render_timer.setSingleShot(True)
+        self._precache_render_timer.timeout.connect(self._precache_render_next)
         self.current_model = None
         self.current_pixmap = None   # original unscaled pixmap for static images
         self.image_zoom = 1.0        # zoom factor relative to original pixel size
@@ -1636,6 +1688,14 @@ class MainWindow(QMainWindow):
             self.precache_worker.start()
 
     def _on_precache_model_loaded(self, filepath, model_data):
+        self._precache_render_queue.append((filepath, model_data))
+        if not self._precache_render_timer.isActive():
+            self._precache_render_timer.start(0)
+
+    def _precache_render_next(self):
+        if not self._precache_render_queue:
+            return
+        filepath, model_data = self._precache_render_queue.popleft()
         try:
             png_bytes = generate_vtk_thumbnail(model_data)
             if png_bytes:
@@ -1646,9 +1706,15 @@ class MainWindow(QMainWindow):
                     self.thumbnail_grid._on_thumbnail_ready(filepath, pixmap)
         except Exception as e:
             print(f"Error rendering pre-cached thumbnail for {filepath}: {e}")
+        if self._precache_render_queue:
+            self._precache_render_timer.start(0)
 
     def closeEvent(self, event):
         """Clean up background workers and interactor when closing."""
+        if hasattr(self, '_precache_render_timer'):
+            self._precache_render_timer.stop()
+        if hasattr(self, '_precache_render_queue'):
+            self._precache_render_queue.clear()
         if hasattr(self, 'thumbnail_grid') and self.thumbnail_grid:
             if hasattr(self.thumbnail_grid, '_stop_workers'):
                 self.thumbnail_grid._stop_workers()
