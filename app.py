@@ -585,6 +585,10 @@ class ThumbnailCard(QFrame):
 
 class ThumbnailGridWidget(QWidget):
     card_clicked = Signal(str)
+    status_message = Signal(str)   # forwarded to MainWindow status bar
+
+    _THUMB_SIZE_LIMIT = 10 * 1024 * 1024  # skip VTK render for files > 10 MB
+    _CARD_BATCH = 50                       # cards created per event-loop tick
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -597,6 +601,14 @@ class ThumbnailGridWidget(QWidget):
         self._render_timer.timeout.connect(self._render_next)
         self._total_pending = 0
         self._rendered_count = 0
+        self._total_file_count = 0
+
+        # Deferred card-creation state
+        self._pending_card_paths = deque()
+        self._pending_uncached = []
+        self._card_timer = QTimer(self)
+        self._card_timer.setSingleShot(True)
+        self._card_timer.timeout.connect(self._create_card_batch)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -624,6 +636,9 @@ class ThumbnailGridWidget(QWidget):
         self.layout = self._grid_layout  # backward-compat alias
 
     def _stop_workers(self):
+        self._card_timer.stop()
+        self._pending_card_paths.clear()
+        self._pending_uncached.clear()
         self._render_timer.stop()
         self._render_queue.clear()
         if self.generator_worker and self.generator_worker.isRunning():
@@ -643,33 +658,66 @@ class ThumbnailGridWidget(QWidget):
         self._rendered_count = 0
         self._total_pending = 0
 
-        for filepath in filepaths:
-            card = ThumbnailCard(filepath)
-            card.clicked.connect(self.card_clicked.emit)
-            self.cards[filepath] = card
-            self._ordered_paths.append(filepath)
-
-        self.rearrange_grid()
-
-        uncached_3d = []
         mesh_exts = {'.stl', '.3mf', '.obj', '.gcode', '.gco'}
         cache = get_thumb_cache()
+        uncached_3d = []
         for filepath in filepaths:
             ext = os.path.splitext(filepath)[1].lower()
             if ext in mesh_exts and not cache.is_valid(filepath):
-                uncached_3d.append(filepath)
+                try:
+                    if os.path.getsize(filepath) <= self._THUMB_SIZE_LIMIT:
+                        uncached_3d.append(filepath)
+                except OSError:
+                    pass
 
-        if uncached_3d:
-            self._total_pending = len(uncached_3d)
-            self._progress_bar.setRange(0, self._total_pending)
-            self._progress_bar.setValue(0)
-            self._progress_bar.setFormat(
-                f"Generating thumbnails: 0 / {self._total_pending}"
-            )
-            self._progress_bar.show()
-            self.generator_worker = ThumbnailGeneratorWorker(uncached_3d)
-            self.generator_worker.model_loaded.connect(self._on_geom_loaded)
-            self.generator_worker.start()
+        # Kick off deferred card creation (50 cards per event-loop tick).
+        # _ordered_paths is populated inside _create_card_batch so rearrange_grid
+        # only sees paths that already have a card widget.
+        self._total_file_count = len(filepaths)
+        self._pending_card_paths = deque(filepaths)
+        self._pending_uncached = uncached_3d
+        self._card_timer.start(0)
+
+    def _create_card_batch(self):
+        """Create up to _CARD_BATCH cards, then yield to the event loop."""
+        for _ in range(self._CARD_BATCH):
+            if not self._pending_card_paths:
+                break
+            filepath = self._pending_card_paths.popleft()
+            card = ThumbnailCard(filepath)
+            card.clicked.connect(self.card_clicked.emit)
+            self.cards[filepath] = card
+            self._ordered_paths.append(filepath)  # only add once the card exists
+
+        self.rearrange_grid()
+
+        n = len(self._ordered_paths)
+        total = self._total_file_count
+        if self._pending_card_paths:
+            self.status_message.emit(f"Loading folder: {n} / {total} files ...")
+            self._card_timer.start(0)
+        else:
+            self.status_message.emit(f"Folder loaded: {total} files")
+            self._start_geometry_loading(self._pending_uncached)
+            self._pending_uncached = []
+
+    def _start_geometry_loading(self, uncached_3d):
+        if not uncached_3d:
+            return
+        self._total_pending = len(uncached_3d)
+        self._rendered_count = 0
+        self._progress_bar.setRange(0, self._total_pending)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setFormat(
+            f"Generating thumbnails: 0 / {self._total_pending}"
+        )
+        self._progress_bar.show()
+        self.status_message.emit(
+            f"Generating {self._total_pending} thumbnails (files > 10 MB skipped) ..."
+        )
+        self.generator_worker = ThumbnailGeneratorWorker(uncached_3d)
+        self.generator_worker.model_loaded.connect(self._on_geom_loaded)
+        self.generator_worker.start()
 
     def _on_geom_loaded(self, filepath, model_data):
         """Geometry loaded on background thread — queue it for main-thread VTK render."""
@@ -682,6 +730,10 @@ class ThumbnailGridWidget(QWidget):
         if not self._render_queue:
             return
         filepath, model_data = self._render_queue.popleft()
+        basename = os.path.basename(filepath)
+        self.status_message.emit(
+            f"Rendering thumbnail {self._rendered_count + 1} / {self._total_pending}  —  {basename}"
+        )
         try:
             png_bytes = generate_vtk_thumbnail(model_data)
             if png_bytes:
@@ -699,6 +751,9 @@ class ThumbnailGridWidget(QWidget):
         )
         if self._rendered_count >= self._total_pending:
             self._progress_bar.hide()
+            self.status_message.emit(
+                f"All {self._total_pending} thumbnails ready  —  {self._total_file_count} files in folder"
+            )
         if self._render_queue:
             self._render_timer.start(0)
 
@@ -725,6 +780,26 @@ class ThumbnailGridWidget(QWidget):
             self._grid_layout.addWidget(self.cards[filepath], r, c)
 
 
+class ClickableLabel(QLabel):
+    """QLabel that copies its toolTip (full path) to clipboard on left-click."""
+    copied = Signal(str)
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setStyleSheet(
+            "color: #00C9D4; font-size: 10px; text-decoration: underline; background: transparent;"
+        )
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            full_path = self.toolTip()
+            if full_path:
+                QApplication.clipboard().setText(full_path)
+                self.copied.emit(full_path)
+        super().mousePressEvent(event)
+
+
 class MainWindow(QMainWindow):
     """Main window for the STL/3MF file viewer application."""
     
@@ -738,6 +813,7 @@ class MainWindow(QMainWindow):
         
         self.active_worker = None
         self.precache_worker = None
+        self._current_filepath = None
         self._precache_render_queue = deque()
         self._precache_render_timer = QTimer(self)
         self._precache_render_timer.setSingleShot(True)
@@ -751,6 +827,10 @@ class MainWindow(QMainWindow):
         self._img_drag_scroll_start = None  # (h_value, v_value) at press
         
         self._init_ui()
+        self.thumbnail_grid.status_message.connect(self.status_bar.showMessage)
+        self.meta_labels["file_path"].copied.connect(
+            lambda p: self.status_bar.showMessage(f"Path copied to clipboard: {p}")
+        )
         self._setup_file_browser()
         
     def _init_ui(self):
@@ -770,7 +850,7 @@ class MainWindow(QMainWindow):
         header_layout = QHBoxLayout()
         logo_label = QLabel("⚡")
         logo_label.setStyleSheet("font-size: 20px; color: #00F0FF;")
-        title_label = QLabel("Apex 3D View")
+        title_label = QLabel("STL 3D View")
         title_label.setObjectName("HeaderLabel")
         header_layout.addWidget(logo_label)
         header_layout.addWidget(title_label)
@@ -795,11 +875,18 @@ class MainWindow(QMainWindow):
         self.dir_label.editingFinished.connect(self._on_path_editing_finished)
         self._path_navigated_via_return = False
 
+        up_btn = QPushButton("↑")
+        up_btn.setFixedWidth(28)
+        up_btn.setToolTip("Go up one folder level")
+        up_btn.clicked.connect(self._navigate_up)
+        up_btn.setStyleSheet("padding: 4px 4px; font-size: 14px;")
+
         change_dir_btn = QPushButton("Browse...")
         change_dir_btn.clicked.connect(self._change_root_directory)
         change_dir_btn.setStyleSheet("padding: 4px 8px; font-size: 11px;")
 
         cd_layout.addWidget(self.dir_label, stretch=1)
+        cd_layout.addWidget(up_btn)
         cd_layout.addWidget(change_dir_btn)
         browser_layout.addLayout(cd_layout)
         
@@ -827,21 +914,29 @@ class MainWindow(QMainWindow):
         self.meta_labels = {}
         fields = [
             ("file_name", "Filename:"),
+            ("file_size", "File Size:"),
+            ("file_path", "Path:"),
             ("format", "Format:"),
             ("vertices", "Vertices:"),
             ("triangles", "Triangles:"),
             ("bounds", "Dimensions:"),
             ("volume", "Est. Volume:")
         ]
-        
+
         self.meta_row_labels = {}
         for idx, (key, label_text) in enumerate(fields):
             label = QLabel(label_text)
             self.meta_row_labels[key] = label
-            val_label = QLabel("-")
-            val_label.setObjectName("ValueLabel")
-            val_label.setWordWrap(True)
-            
+            if key == "file_path":
+                val_label = ClickableLabel("-")
+                val_label.setObjectName("ValueLabel")
+                val_label.setWordWrap(True)
+                val_label.setToolTip("")
+            else:
+                val_label = QLabel("-")
+                val_label.setObjectName("ValueLabel")
+                val_label.setWordWrap(True)
+
             meta_layout.addWidget(label, idx, 0)
             meta_layout.addWidget(val_label, idx, 1)
             self.meta_labels[key] = val_label
@@ -1119,6 +1214,16 @@ class MainWindow(QMainWindow):
             # Pre-cache directory thumbnails in background
             self._precache_directory_thumbnails(selected_dir)
 
+    def _navigate_up(self):
+        """Navigate the file tree root up one directory level."""
+        current_root = os.path.normpath(self.file_model.filePath(self.tree_view.rootIndex()))
+        parent = os.path.dirname(current_root)
+        if parent and parent != current_root:
+            self.tree_view.setRootIndex(self.file_model.index(parent))
+            self.dir_label.setText(parent)
+            self.status_bar.showMessage(f"Navigated to: {parent}")
+            self._precache_directory_thumbnails(parent)
+
     def _file_selected(self, selected, deselected):
         """Load file (mesh or media) when selected in the browser."""
         indexes = selected.indexes()
@@ -1161,13 +1266,21 @@ class MainWindow(QMainWindow):
             # Switch Stack back to VTK
             self.viewport_stack.setCurrentIndex(0)
             
-            self.status_bar.showMessage(f"Loading {os.path.basename(filepath)}...")
+            basename = os.path.basename(filepath)
+            try:
+                size_str = self._format_file_size(os.path.getsize(filepath))
+            except OSError:
+                size_str = ""
+            self.status_bar.showMessage(
+                f"Reading: {basename}  ({size_str})" if size_str else f"Reading: {basename}"
+            )
             self._reset_metadata_labels()
-            
+
             # Show loading spinner overlay centered on viewport
-            self.loading_overlay.show_loading(f"Parsing {os.path.basename(filepath)}...")
+            self.loading_overlay.show_loading(f"Parsing {basename} ...")
             
             # Initialize async loader
+            self._current_filepath = filepath
             self.active_worker = ModelLoaderWorker(filepath)
             self.active_worker.finished.connect(self._on_model_loaded)
             self.active_worker.start()
@@ -1179,6 +1292,12 @@ class MainWindow(QMainWindow):
             self.active_worker.wait()
         self._cleanup_media_playback()
 
+        # Stop precache geometry worker and any queued VTK renders so they don't
+        # compete with the thumbnail grid's own render timer.
+        if hasattr(self, '_precache_render_timer'):
+            self._precache_render_timer.stop()
+        if hasattr(self, '_precache_render_queue'):
+            self._precache_render_queue.clear()
         if hasattr(self, 'precache_worker') and self.precache_worker and self.precache_worker.isRunning():
             self.precache_worker.stop()
             self.precache_worker.wait()
@@ -1209,6 +1328,11 @@ class MainWindow(QMainWindow):
         self.meta_row_labels["triangles"].setText("Total Files:")
         self.meta_row_labels["volume"].setText("Total Size:")
         self.meta_labels["file_name"].setText(os.path.basename(filepath) or filepath)
+        norm = os.path.normpath(filepath)
+        self.meta_labels["file_size"].setText("N/A")
+        fm = self.meta_labels["file_path"].fontMetrics()
+        self.meta_labels["file_path"].setText(fm.elidedText(norm, Qt.ElideLeft, 160))
+        self.meta_labels["file_path"].setToolTip(norm)
         self.meta_labels["format"].setText("Directory")
         self.meta_labels["vertices"].setText("N/A")
         self.meta_labels["triangles"].setText(f"{len(supported_files)}")
@@ -1222,8 +1346,9 @@ class MainWindow(QMainWindow):
                 pass
         self.meta_labels["volume"].setText(self._format_file_size(total_bytes))
         self.dir_label.setText(os.path.normpath(filepath))
+        folder_name = os.path.basename(filepath) or filepath
         self.status_bar.showMessage(
-            f"Scanning folder: {os.path.basename(filepath)} | {len(supported_files)} files found."
+            f"Folder: {folder_name}  —  {len(supported_files)} files  —  {self._format_file_size(total_bytes)}"
         )
 
     def _on_thumbnail_clicked(self, filepath):
@@ -1268,18 +1393,32 @@ class MainWindow(QMainWindow):
         is_gcode = hasattr(result, 'lines') and len(result.lines) > 0
         if is_gcode:
             self.status_bar.showMessage(
-                f"Successfully loaded {result.filename} in {result.load_time_ms:.1f}ms. "
-                f"Lines: {result.num_lines:,} | Format: {result.format}"
+                f"Loaded: {result.filename}  —  {result.format}  —  "
+                f"{result.num_lines:,} lines  —  {result.load_time_ms:.0f} ms"
             )
         else:
             self.status_bar.showMessage(
-                f"Successfully loaded {result.filename} in {result.load_time_ms:.1f}ms. "
-                f"Triangles: {result.num_triangles:,} | Format: {result.format}"
+                f"Loaded: {result.filename}  —  {result.format}  —  "
+                f"{result.num_vertices:,} vertices, {result.num_triangles:,} triangles  —  {result.load_time_ms:.0f} ms"
             )
 
     def _update_metadata_ui(self, model):
         """Bind dynamic text to metadata cards."""
         self.meta_labels["file_name"].setText(model.filename)
+
+        fp = self._current_filepath or ""
+        try:
+            size_str = self._format_file_size(os.path.getsize(fp)) if fp else "-"
+        except OSError:
+            size_str = "-"
+        self.meta_labels["file_size"].setText(size_str)
+
+        norm = os.path.normpath(fp) if fp else "-"
+        fm = self.meta_labels["file_path"].fontMetrics()
+        elided = fm.elidedText(norm, Qt.ElideLeft, 160)
+        self.meta_labels["file_path"].setText(elided)
+        self.meta_labels["file_path"].setToolTip(norm)
+
         self.meta_labels["format"].setText(model.format)
         self.meta_labels["vertices"].setText(f"{model.num_vertices:,}")
         
@@ -1312,8 +1451,10 @@ class MainWindow(QMainWindow):
         """Clear details panel text during loading state."""
         self.meta_row_labels["triangles"].setText("Triangles:")
         self.meta_row_labels["volume"].setText("Est. Volume:")
-        for val_label in self.meta_labels.values():
+        for key, val_label in self.meta_labels.items():
             val_label.setText("Loading...")
+            if key == "file_path":
+                val_label.setToolTip("")
 
     def _toggle_image_visibility(self, state):
         """Toggle media files visibility in the file browser model."""
@@ -1368,12 +1509,19 @@ class MainWindow(QMainWindow):
 
     def _load_media_file(self, filepath, ext):
         """Directly parse and load media files inside the StackedWidget."""
-        self.status_bar.showMessage(f"Loading media: {os.path.basename(filepath)}...")
+        basename = os.path.basename(filepath)
+        self.status_bar.showMessage(f"Reading: {basename} ...")
         self._reset_metadata_labels()
-        
-        # Get file size for metadata display
+        self._current_filepath = filepath
+
+        # File size + path (shared across all media types)
         file_size_bytes = os.path.getsize(filepath)
         size_str = self._format_file_size(file_size_bytes)
+        self.meta_labels["file_size"].setText(size_str)
+        norm = os.path.normpath(filepath)
+        fm = self.meta_labels["file_path"].fontMetrics()
+        self.meta_labels["file_path"].setText(fm.elidedText(norm, Qt.ElideLeft, 160))
+        self.meta_labels["file_path"].setToolTip(norm)
         
         # Hide standard image label and SVG widget first, then show appropriate one
         self.image_label.hide()
@@ -1401,7 +1549,9 @@ class MainWindow(QMainWindow):
                 self.meta_labels["triangles"].setText("N/A")
                 self.meta_labels["bounds"].setText(f"{pixmap.width()} x {pixmap.height()} px")
                 self.meta_labels["volume"].setText(size_str)
-                self.status_bar.showMessage(f"Loaded image: {os.path.basename(filepath)} ({pixmap.width()}x{pixmap.height()})")
+                self.status_bar.showMessage(
+                    f"Image: {basename}  —  {ext[1:].upper()}  —  {pixmap.width()} × {pixmap.height()} px  —  {size_str}"
+                )
             else:
                 self.status_bar.showMessage("Error: Failed to load image file.")
 
@@ -1438,7 +1588,9 @@ class MainWindow(QMainWindow):
             self.meta_labels["triangles"].setText("N/A")
             self.meta_labels["bounds"].setText(f"{w} x {h} px")
             self.meta_labels["volume"].setText(size_str)
-            self.status_bar.showMessage(f"Playing animated GIF: {os.path.basename(filepath)}")
+            self.status_bar.showMessage(
+                f"GIF: {basename}  —  Animated  —  {w} × {h} px  —  {size_str}"
+            )
             
         elif ext == '.svg':
             # --- VECTOR SVGS ---
@@ -1466,7 +1618,9 @@ class MainWindow(QMainWindow):
             self.meta_labels["triangles"].setText("N/A")
             self.meta_labels["bounds"].setText(f"{svg_size.width()} x {svg_size.height()} px")
             self.meta_labels["volume"].setText(size_str)
-            self.status_bar.showMessage(f"Loaded vector SVG: {os.path.basename(filepath)}")
+            self.status_bar.showMessage(
+                f"SVG: {basename}  —  Vector  —  {svg_size.width()} × {svg_size.height()} px  —  {size_str}"
+            )
             
         elif ext == '.webm':
             # --- WEBM VIDEOS ---
@@ -1489,7 +1643,9 @@ class MainWindow(QMainWindow):
             self.meta_labels["triangles"].setText("WebM Video Stream")
             self.meta_labels["bounds"].setText("N/A")
             self.meta_labels["volume"].setText(size_str)
-            self.status_bar.showMessage(f"Playing video: {os.path.basename(filepath)}")
+            self.status_bar.showMessage(
+                f"Video: {basename}  —  WebM  —  {size_str}"
+            )
 
     def _toggle_video_playback(self):
         if self.media_player.playbackState() == QMediaPlayer.PlayingState:

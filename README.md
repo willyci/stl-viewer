@@ -1,4 +1,4 @@
-# Apex 3D Viewer
+# STL 3D Viewer
 
 A desktop 3D file viewer built with Python, PySide6, and VTK. Supports STL, 3MF, OBJ, G-Code, and common image/video formats with a dark theme UI.
 
