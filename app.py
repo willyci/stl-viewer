@@ -249,7 +249,20 @@ _thumb_cache: "ThumbnailCache | None" = None
 def get_thumb_cache() -> "ThumbnailCache":
     global _thumb_cache
     if _thumb_cache is None:
-        db_dir = os.path.join(os.path.expanduser("~"), ".gemini", "antigravity-ide")
+        # Determine the directory where the app is located
+        if getattr(sys, 'frozen', False):
+            app_dir = os.path.dirname(sys.executable)
+        else:
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+            
+        # Check if portable mode is enabled via a marker file 'portable.txt'
+        portable_marker = os.path.join(app_dir, "portable.txt")
+        if os.path.exists(portable_marker):
+            db_dir = os.path.join(app_dir, "cache")
+            print(f"Portable mode active: using database at {os.path.join(db_dir, 'thumbnails.db')}")
+        else:
+            db_dir = os.path.join(os.path.expanduser("~"), ".gemini", "antigravity-ide")
+            
         os.makedirs(db_dir, exist_ok=True)
         _thumb_cache = ThumbnailCache(os.path.join(db_dir, "thumbnails.db"))
     return _thumb_cache

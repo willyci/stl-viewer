@@ -79,10 +79,20 @@ Requires [PyInstaller](https://pyinstaller.org):
 
 ```bash
 pip install pyinstaller
-pyinstaller app.spec
 ```
 
+### Option A: Standard Build (uses user profile cache)
+```bash
+pyinstaller app.spec
+```
 Output: `dist\STLViewer\STLViewer.exe` (run from the folder — do not move the EXE out of `dist\STLViewer\`).
+
+### Option B: Portable Build (self-contained local cache)
+Run the helper batch script:
+```cmd
+build_portable.bat
+```
+This compiles the application and automatically injects the `portable.txt` marker into the compiled folder. You can then zip/compress the `dist\STLViewer\` folder to distribute a fully portable, plug-and-play version!
 
 ---
 
@@ -110,11 +120,19 @@ stl_viewer/
 
 ## Thumbnail Cache
 
-Thumbnails are stored in a SQLite database at:
+By default, thumbnails are stored in an SQLite database at:
 
 ```
 %USERPROFILE%\.gemini\antigravity-ide\thumbnails.db
 ```
+
+### Portable Mode
+If you prefer to run the application in **Portable Mode** (e.g., from a USB drive or a self-contained folder) where all cached data is kept inside the application folder:
+1. Create an empty file named `portable.txt` in the same directory as the executable (`STLViewer.exe` or `app.py`).
+2. The application will automatically detect this file and store/load the `thumbnails.db` database inside a `cache` subdirectory under the application folder:
+   ```
+   <app_directory>\cache\thumbnails.db
+   ```
 
 Each entry is keyed on `MD5(absolute_path)` and invalidated automatically when the file's modification time or size changes. Delete the database to force a full re-render.
 
