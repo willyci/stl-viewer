@@ -1,0 +1,26 @@
+[package]
+name = "stl-viewer"
+description = "Desktop viewer for STL, 3MF, OBJ, G-code, images and WebM"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "STLViewer"
+path = "src/main.rs"
+
+[dependencies]
+stlv-core.workspace = true
+stlv-render.workspace = true
+stlv-thumbs.workspace = true
+stlv-media.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+image.workspace = true
+resvg.workspace = true
+rfd.workspace = true
+log.workspace = true
+env_logger.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

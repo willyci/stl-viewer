@@ -1,0 +1,10 @@
+[package]
+name = "stlv-core"
+description = "Geometry model, file parsers and shared helpers for STL Viewer (no GUI)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+zip.workspace = true
+roxmltree.workspace = true

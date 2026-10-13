@@ -1,0 +1,7 @@
+# windows-gnu only: link with LLVM lld instead of GNU ld.
+# The `windows`/wgpu crates use raw-dylib imports; GNU ld mis-links the LLVM-style
+# import libraries and the resulting exe crashes before main. lld handles them.
+# Requires `ld.lld` and `dlltool` on PATH -- run cargo through build.ps1 / env.sh.
+# (The MSVC toolchain ignores this section.)
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
